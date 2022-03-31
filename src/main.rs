@@ -1,38 +1,38 @@
 use anyhow::Result;
+use thiserror::Error;
+use widestring::U16CString;
+use windows::core::{PCSTR, PCWSTR};
+use windows::Win32::{
+    Foundation::{CloseHandle, GetLastError, HANDLE},
+    Storage::FileSystem::GetFullPathNameW,
+    System::{
+        Diagnostics::{
+            Debug::WriteProcessMemory,
+            ToolHelp::{
+                CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
+                TH32CS_SNAPPROCESS,
+            },
+        },
+        LibraryLoader::{GetModuleHandleA, GetProcAddress},
+        Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        },
+        Threading::{
+            CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+            PROCESS_ALL_ACCESS,
+        },
+        WindowsProgramming::INFINITE,
+    },
+};
+
 use std::ffi;
-use std::fmt::Debug;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops;
-use thiserror::Error;
-use widestring::U16CString;
-use windows::core::PCSTR;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Foundation::GetLastError;
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::GetFullPathNameW;
-use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::CreateToolhelp32Snapshot;
-use windows::Win32::System::Diagnostics::ToolHelp::Process32First;
-use windows::Win32::System::Diagnostics::ToolHelp::Process32Next;
-use windows::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32;
-use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPPROCESS;
-use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::LibraryLoader::GetProcAddress;
-use windows::Win32::System::Memory::VirtualAllocEx;
-use windows::Win32::System::Memory::VirtualFreeEx;
-use windows::Win32::System::Memory::MEM_COMMIT;
-use windows::Win32::System::Memory::MEM_RELEASE;
-use windows::Win32::System::Memory::MEM_RESERVE;
-use windows::Win32::System::Memory::PAGE_READWRITE;
-use windows::Win32::System::Threading::CreateRemoteThread;
-use windows::Win32::System::Threading::OpenProcess;
-use windows::Win32::System::Threading::WaitForSingleObject;
-use windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS;
-use windows::Win32::System::Threading::PROCESS_ALL_ACCESS;
-use windows::Win32::System::WindowsProgramming::INFINITE;
+use std::thread;
+use std::time;
 
 /*
 Sources Used:
@@ -53,8 +53,12 @@ pub enum ProcessErrors<T> {
 }
 
 fn main() -> Result<()> {
-    let process_target = "Notepad.exe";
-    let process = Process::open_from_process_name(PROCESS_ALL_ACCESS, process_target)?;
+    println!("Input process name, along with extension:");
+    let mut process_target = String::new();
+    io::stdin().read_line(&mut process_target)?;
+
+    let process =
+        Process::open_from_process_name(PROCESS_ALL_ACCESS, process_target.trim().to_string())?;
 
     let full_path_name = __GetFullPathNameW("64_bit.dll")?;
     let full_path_name_len = full_path_name.len() * 2 + 1;
@@ -100,6 +104,9 @@ fn main() -> Result<()> {
         CloseHandle(remote_thread_handle);
         VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
     };
+
+    println!("\nFinished injection and closed handles.");
+    thread::sleep(time::Duration::from_secs(3));
 
     Ok(())
 }
