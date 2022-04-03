@@ -7,21 +7,20 @@ use std::ops;
 use thiserror::Error;
 use widestring::U16CString;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HINSTANCE;
-use windows::Win32::System::ProcessStatus::K32EnumProcessModules;
-use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExA;
-use windows::Win32::System::ProcessStatus::K32GetModuleInformation;
-use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameA;
-use windows::Win32::System::ProcessStatus::MODULEINFO;
 use windows::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE},
+    Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, HINSTANCE},
     Storage::FileSystem::GetFullPathNameW,
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32First, Process32Next, Thread32First, Thread32Next,
             PROCESSENTRY32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
         },
-        Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS},
+        ProcessStatus::{
+            K32EnumProcessModules, K32GetModuleFileNameExA, K32GetModuleInformation,
+            K32GetProcessImageFileNameA, MODULEINFO,
+        },
+        SystemInformation::{GetNativeSystemInfo, SYSTEM_INFO},
+        Threading::{IsWow64Process, OpenProcess, PROCESS_ACCESS_RIGHTS},
     },
 };
 
@@ -33,6 +32,8 @@ pub enum ProcessErrors<T> {
     OpenProcessFailure(u32, u32, u32),
     #[error("Failed to construct full path for {0}")]
     FullPathNameFailure(T),
+    #[error("Failed to check if process is 64-bit {0}")]
+    IsWow64Error(u32),
 }
 
 #[allow(non_snake_case)]
@@ -64,6 +65,35 @@ impl<T> Process<T>
 where
     T: AsRef<str> + ToString + Send + Sync + Debug + Display + 'static,
 {
+    pub fn is_system_x64(&self) -> bool {
+        unsafe {
+            let mut sys_info: SYSTEM_INFO = mem::zeroed();
+            GetNativeSystemInfo(&mut sys_info as *mut _);
+            return sys_info.Anonymous.Anonymous.wProcessorArchitecture.0 == 9;
+        }
+    }
+    pub fn is_x64_compatible(&self) -> Result<bool> {
+        let is_process_x64 = self.is_x64_process();
+        match is_process_x64 {
+            Ok(is_process_x64) => {
+                if self.is_system_x64() {
+                    return Ok(is_process_x64);
+                } else {
+                    return Ok(false);
+                }
+            }
+            Err(_) => return is_process_x64,
+        }
+    }
+    pub fn is_x64_process(&self) -> Result<bool> {
+        unsafe {
+            let mut is_bool: BOOL = mem::zeroed();
+            if !IsWow64Process(self.handle, &mut is_bool as *mut _).as_bool() {
+                return Err(ProcessErrors::<T>::IsWow64Error(GetLastError().0).into());
+            }
+            Ok(!is_bool.as_bool())
+        }
+    }
     pub fn open_from_process_id(
         access_rights: PROCESS_ACCESS_RIGHTS,
         module_name: T,

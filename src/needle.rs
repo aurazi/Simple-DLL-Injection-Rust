@@ -1,6 +1,7 @@
 #![allow(non_camel_case_types)]
 
 use anyhow::Result;
+use std::fmt::{Debug, Display};
 use std::hint::black_box;
 use std::mem;
 use std::ptr::copy_nonoverlapping;
@@ -12,7 +13,8 @@ use windows::Win32::{
     Foundation::{CloseHandle, GetLastError, LPARAM, WPARAM},
     System::{
         Diagnostics::Debug::{
-            GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT,
+            GetThreadContext, ReadProcessMemory, SetThreadContext, Wow64GetThreadContext,
+            Wow64SetThreadContext, WriteProcessMemory, CONTEXT, WOW64_CONTEXT,
         },
         LibraryLoader::{GetModuleHandleA, GetProcAddress},
         Memory::{
@@ -69,21 +71,316 @@ pub enum InjectionMethod<'a> {
     LoadLibrary,
     x64ShellCode(&'a [u8]),
     x64ThreadHijacking,
+
+    x86ShellCode(&'a [u8]),
+    x86ThreadHijacking,
+}
+impl<'a> InjectionMethod<'a> {
+    fn is_x64(&self) -> bool {
+        use InjectionMethod::*;
+        match self {
+            x64ShellCode(_) => true,
+            x64ThreadHijacking => true,
+            _ => false,
+        }
+    }
 }
 
-impl<T> Needle<T> {
+impl<T> Needle<T>
+where
+    T: AsRef<str> + ToString + Send + Sync + Debug + Display + 'static,
+{
     pub fn from_process(process: Process<T>) -> Self {
         Self(process)
     }
-    pub fn inject(&self, injection_method: InjectionMethod, cpath: Option<CPath>) -> Result<()> {
+    pub fn inject(
+        &self,
+        mut injection_method: InjectionMethod,
+        cpath: Option<CPath>,
+    ) -> Result<()> {
         if let Some(ref cpath) = cpath {
             if !cpath.path_exists() {
                 return Err(InjectionErrors::PathDoesNotExistError.into());
             }
         }
-
         use InjectionMethod::*;
+
+        if !self.0.is_system_x64() && injection_method.is_x64() {
+            println!("[Warning]: Architecture is not x64 compatible!\nInjection methods that only support x64 will be automatically set to a x86 version.");
+            match injection_method {
+                x64ShellCode(shellcode) => injection_method = x86ShellCode(shellcode),
+                x64ThreadHijacking => injection_method = x86ThreadHijacking,
+                _ => {}
+            }
+        }
+
         match injection_method {
+            x86ThreadHijacking => unsafe {
+                let cpath = cpath.unwrap();
+                let thread_id = get_thread_id_off_process_id(self.0.pid);
+                if thread_id == 0 {
+                    return Err(InjectionErrors::NoThread.into());
+                }
+                let thread_handle = OpenThread(THREAD_ALL_ACCESS, false, thread_id);
+                if thread_handle.is_invalid() {
+                    return Err(
+                        InjectionErrors::OpenThreadError(thread_id, GetLastError().0).into(),
+                    );
+                }
+                if SuspendThread(thread_handle) == u32::MAX {
+                    // windows returns -1 but windows-rs returns a u32.
+                    CloseHandle(thread_handle);
+                    return Err(
+                        InjectionErrors::SuspendThreadError(thread_id, GetLastError().0).into(),
+                    );
+                }
+                let _align_16_start_ = black_box([0xFFFFu16; 1]);
+                let mut tcontext: WOW64_CONTEXT = mem::zeroed();
+                tcontext.ContextFlags = CONTEXT_FULL;
+                if !Wow64GetThreadContext(thread_handle, &mut tcontext).as_bool() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    return Err(InjectionErrors::GetThreadContextError(
+                        thread_id,
+                        GetLastError().0,
+                    )
+                    .into());
+                }
+                let _align_16_end_ = black_box(&_align_16_start_);
+                let dllpath_addr = VirtualAllocEx(
+                    self.0.handle,
+                    core::ptr::null_mut(),
+                    cpath.len(),
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                );
+                if dllpath_addr.is_null() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
+                }
+                if WriteProcessMemory(
+                    self.0.handle,
+                    dllpath_addr,
+                    cpath.as_ptr(),
+                    cpath.len(),
+                    core::ptr::null_mut(),
+                )
+                .0 == 0
+                {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
+                }
+                let kernel_module = GetModuleHandleA(PCSTR("kernel32.dll\0".as_ptr()));
+                if kernel_module.is_invalid() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::GetModuleHandleAError(GetLastError().0).into());
+                }
+                let loadlib_addr = GetProcAddress(kernel_module, PCSTR("LoadLibraryW\0".as_ptr()));
+                let mut payload = [
+                    0x00, 0x00, 0x00,
+                    0x00, // - 0x04 (pCodecave)	-> returned value							;buffer to store returned value (eax)
+                    0x83, 0xEC,
+                    0x04, // + 0x00				-> sub esp, 0x04							;prepare stack for ret
+                    0xC7, 0x04, 0x24, 0x00, 0x00, 0x00,
+                    0x00, // + 0x03 (+ 0x06)		-> mov [esp], OldEip						;store old eip as return address
+                    0x50, 0x51, 0x52, // + 0x0A				-> psuh e(a/c/d)							;save e(a/c/d)x
+                    0x9C, // + 0x0D				-> pushfd									;save flags register
+                    0xB9, 0x00, 0x00, 0x00,
+                    0x00, // + 0x0E (+ 0x0F)		-> mov ecx, pArg							;load pArg into ecx
+                    0xB8, 0x00, 0x00, 0x00, 0x00, // + 0x13 (+ 0x14)		-> mov eax, pRoutine
+                    0x51, // + 0x18				-> push ecx									;push pArg
+                    0xFF, 0xD0, // + 0x19				-> call eax									;call target function
+                    0xA3, 0x00, 0x00, 0x00,
+                    0x00, // + 0x1B (+ 0x1C)		-> mov dword ptr[pCodecave], eax			;store returned value
+                    0x9D, // + 0x20				-> popfd									;restore flags register
+                    0x5A, 0x59, 0x58, // + 0x21				-> pop e(d/c/a)								;restore e(d/c/a)x
+                    0xC6, 0x05, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // + 0x24 (+ 0x26)		-> mov byte ptr[pCodecave + 0x06], 0x00		;set checkbyte to 0
+                    0xC3u8,
+                ];
+                let mut payload_pointer;
+                let code_cave = VirtualAllocEx(
+                    self.0.handle,
+                    core::ptr::null_mut(),
+                    payload.len(),
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                );
+                if code_cave.is_null() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
+                }
+
+                // set up shellcode
+                let dissected_address;
+                let dissected_dllpath_addr;
+                let dissected_loadlib_addr;
+                let dissected_code_cave_addr;
+                let dissected_byte_offset_addr;
+
+                if cfg!(target_endian = "big") {
+                    dissected_byte_offset_addr = (code_cave as u32 + 0x06).to_be_bytes();
+                    dissected_code_cave_addr = (code_cave as u32).to_be_bytes();
+                    dissected_address = tcontext.Eip.to_be_bytes();
+                    dissected_dllpath_addr = (dllpath_addr as u32).to_be_bytes();
+                    dissected_loadlib_addr =
+                        (mem::transmute::<_, *const u32>(loadlib_addr) as u32).to_be_bytes();
+                } else {
+                    dissected_byte_offset_addr = (code_cave as u32 + 0x06).to_le_bytes();
+                    dissected_code_cave_addr = (code_cave as u32).to_le_bytes();
+                    dissected_address = tcontext.Eip.to_le_bytes();
+                    dissected_dllpath_addr = (dllpath_addr as u32).to_le_bytes();
+                    dissected_loadlib_addr =
+                        (mem::transmute::<_, *const u32>(loadlib_addr) as u32).to_le_bytes();
+                }
+                payload_pointer = payload.as_mut_ptr().add(10); // ret
+                copy_nonoverlapping(dissected_address.as_ptr(), payload_pointer, 4);
+                payload_pointer = payload.as_mut_ptr().add(19); // arg for LoadLibraryW
+                copy_nonoverlapping(dissected_dllpath_addr.as_ptr(), payload_pointer, 4);
+                payload_pointer = payload.as_mut_ptr().add(24); // LoadLibraryW address
+                copy_nonoverlapping(dissected_loadlib_addr.as_ptr(), payload_pointer, 4);
+                payload_pointer = payload.as_mut_ptr().add(32); // code cave address
+                copy_nonoverlapping(dissected_code_cave_addr.as_ptr(), payload_pointer, 4);
+                payload_pointer = payload.as_mut_ptr().add(42); // code cave address + byte offset thing
+                copy_nonoverlapping(dissected_byte_offset_addr.as_ptr(), payload_pointer, 4);
+                // end of setting up shellcode
+
+                tcontext.Eip = code_cave as u32 + 0x04;
+                if WriteProcessMemory(
+                    self.0.handle,
+                    code_cave,
+                    payload.as_ptr() as *const _,
+                    payload.len(),
+                    core::ptr::null_mut(),
+                )
+                .0 == 0
+                {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                    VirtualFreeEx(self.0.handle, code_cave, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
+                }
+
+                if !Wow64SetThreadContext(thread_handle, &tcontext).as_bool() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                    VirtualFreeEx(self.0.handle, code_cave, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::SetThreadContextError(
+                        thread_id,
+                        GetLastError().0,
+                    )
+                    .into());
+                }
+
+                PostThreadMessageA(thread_id, 0, WPARAM(0), LPARAM(0));
+                ResumeThread(thread_handle);
+                CloseHandle(thread_handle);
+
+                let _initial_instant = Instant::now();
+                let mut check_byte = 1u8;
+                while check_byte != 0 {
+                    if !ReadProcessMemory(
+                        self.0.handle,
+                        (code_cave as u64 + 0x06) as *mut _,
+                        &mut check_byte as *mut u8 as *mut _,
+                        1,
+                        core::ptr::null_mut(),
+                    )
+                    .as_bool()
+                    {
+                        return Err(
+                            InjectionErrors::ReadProcessMemoryError(GetLastError().0).into()
+                        );
+                    }
+                    if _initial_instant.elapsed().as_millis() > 10000 {
+                        return Err(InjectionErrors::TimeOutError.into());
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                VirtualFreeEx(self.0.handle, code_cave, 0, MEM_RELEASE);
+                VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+            },
+            x86ShellCode(payload) => unsafe {
+                let payload_len = payload.len(); // in bytes
+                let codecave = VirtualAllocEx(
+                    self.0.handle,
+                    core::ptr::null_mut(),
+                    payload_len,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_EXECUTE_READWRITE,
+                );
+                if codecave.is_null() {
+                    return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
+                }
+                if WriteProcessMemory(
+                    self.0.handle,
+                    codecave,
+                    payload.as_ptr() as *const _,
+                    payload_len,
+                    core::ptr::null_mut(),
+                )
+                .0 == 0
+                {
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
+                }
+                let thread_id = get_thread_id_off_process_id(self.0.pid);
+                if thread_id == 0 {
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::NoThread.into());
+                }
+                let thread_handle = OpenThread(THREAD_ALL_ACCESS, false, thread_id);
+                if thread_handle.is_invalid() {
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    return Err(
+                        InjectionErrors::OpenThreadError(thread_id, GetLastError().0).into(),
+                    );
+                }
+                if SuspendThread(thread_handle) == u32::MAX {
+                    // windows returns -1 but windows-rs returns a u32.
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    CloseHandle(thread_handle);
+                    return Err(
+                        InjectionErrors::SuspendThreadError(thread_id, GetLastError().0).into(),
+                    );
+                }
+                let mut tcontext: WOW64_CONTEXT = mem::zeroed();
+                tcontext.ContextFlags = CONTEXT_FULL;
+                if !Wow64GetThreadContext(thread_handle, &mut tcontext).as_bool() {
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    return Err(InjectionErrors::GetThreadContextError(
+                        thread_id,
+                        GetLastError().0,
+                    )
+                    .into());
+                }
+                tcontext.Eip = codecave as u32;
+                if !Wow64SetThreadContext(thread_handle, &tcontext).as_bool() {
+                    ResumeThread(thread_handle);
+                    CloseHandle(thread_handle);
+                    VirtualFreeEx(self.0.handle, codecave, 0, MEM_RELEASE);
+                    return Err(InjectionErrors::SetThreadContextError(
+                        thread_id,
+                        GetLastError().0,
+                    )
+                    .into());
+                }
+
+                PostThreadMessageA(thread_id, 0x0018, WPARAM(0), LPARAM(0));
+                ResumeThread(thread_handle);
+                CloseHandle(thread_handle);
+            },
             x64ThreadHijacking => unsafe {
                 let cpath = cpath.unwrap();
                 let thread_id = get_thread_id_off_process_id(self.0.pid);

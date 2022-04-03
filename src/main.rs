@@ -21,6 +21,12 @@ fn main() -> Result<()> {
     let process =
         Process::open_from_process_name(PROCESS_ALL_ACCESS, process_target.trim().to_string())?;
 
+    println!(
+        "\nSelected process: {}\nPID: {}\n",
+        process_target.trim(),
+        process.pid
+    );
+
     println!("Choose injection method (x64 only):\n[a] LoadLibrary\n[b] ThreadHijacking");
     let injection_method;
     loop {
@@ -44,12 +50,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    println!(
-        "\nInjecting into process: {}\nProcess ID: {}\n",
-        process_target.trim(),
-        process.pid
-    );
 
     let cpath = CPath::new(__GetFullPathNameW("64_bit.dll")?);
 
