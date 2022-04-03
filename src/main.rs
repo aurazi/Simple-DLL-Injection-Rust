@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         process.pid
     );
 
-    println!("Choose injection method (x64 only):\n[a] LoadLibrary\n[b] ThreadHijacking");
+    println!("Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking");
     let injection_method;
     loop {
         process_target.clear();
