@@ -1,3 +1,5 @@
+#![feature(bench_black_box)]
+
 mod needle;
 mod path;
 mod process;

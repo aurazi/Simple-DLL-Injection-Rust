@@ -1,6 +1,7 @@
 #![allow(non_camel_case_types)]
 
 use anyhow::Result;
+use std::hint::black_box;
 use std::mem;
 use std::ptr::copy_nonoverlapping;
 use std::thread;
@@ -106,6 +107,7 @@ impl<T> Needle<T> {
                         InjectionErrors::SuspendThreadError(thread_id, GetLastError().0).into(),
                     );
                 }
+                let _align_16_start_ = black_box([0xFFFFu16; 1]);
                 let mut tcontext: CONTEXT = mem::zeroed();
                 tcontext.ContextFlags = CONTEXT_FULL;
                 if !GetThreadContext(thread_handle, &mut tcontext).as_bool() {
@@ -117,6 +119,7 @@ impl<T> Needle<T> {
                     )
                     .into());
                 }
+                let _align_16_end_ = black_box(&_align_16_start_);
                 let dllpath_addr = VirtualAllocEx(
                     self.0.handle,
                     core::ptr::null_mut(),
@@ -281,6 +284,7 @@ impl<T> Needle<T> {
                     thread::sleep(Duration::from_millis(200));
                 }
                 VirtualFreeEx(self.0.handle, code_cave, 0, MEM_RELEASE);
+                VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
             },
             x64ShellCode(payload) => unsafe {
                 let payload_len = payload.len(); // in bytes
