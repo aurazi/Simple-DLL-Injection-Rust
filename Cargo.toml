@@ -25,4 +25,5 @@ features = [
     "Win32_System_Kernel",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
 ]
