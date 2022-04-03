@@ -14,6 +14,18 @@ use needle::{InjectionMethod, Needle};
 use path::CPath;
 use process::{Process, __GetFullPathNameW};
 
+#[cfg(target_arch = "x86_64")]
+const INJECTION_METHODS_CFG: [InjectionMethod; 2] = [
+    InjectionMethod::LoadLibrary,
+    InjectionMethod::x64ThreadHijacking,
+];
+
+#[cfg(not(target_arch = "x86_64"))]
+const INJECTION_METHODS_CFG: [InjectionMethod; 2] = [
+    InjectionMethod::LoadLibrary,
+    InjectionMethod::x86ThreadHijacking,
+];
+
 fn main() -> Result<()> {
     println!("Input process name, along with extension:");
     let mut process_target = String::new();
@@ -36,12 +48,12 @@ fn main() -> Result<()> {
         match &process_target[..] {
             "a" => {
                 println!("[LoadLibrary] injection method selected\n");
-                injection_method = InjectionMethod::LoadLibrary;
+                injection_method = INJECTION_METHODS_CFG[0];
                 break;
             }
             "b" => {
                 println!("[ThreadHijacking] injection method selected\n");
-                injection_method = InjectionMethod::x64ThreadHijacking;
+                injection_method = INJECTION_METHODS_CFG[1];
                 break;
             }
             _ => {
@@ -50,8 +62,12 @@ fn main() -> Result<()> {
             }
         }
     }
+    println!("Input DLL name with extension");
+    process_target.clear();
+    io::stdin().read_line(&mut process_target)?;
+    let dll = process_target.trim().to_string();
 
-    let cpath = CPath::new(__GetFullPathNameW("64_bit.dll")?);
+    let cpath = CPath::new(__GetFullPathNameW(dll)?);
 
     let needle = Needle::from_process(process);
     needle.inject(injection_method, Some(cpath))?;
