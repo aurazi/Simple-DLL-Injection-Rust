@@ -29,7 +29,7 @@ use windows::Win32::{
 };
 
 use crate::path::CPath;
-use crate::process::{get_base_address_of_process, get_thread_id_off_process_id, Process};
+use crate::process::{get_thread_id_off_process_id, Process};
 
 const CONTEXT_FULL: u32 = 1_048_587;
 
@@ -85,10 +85,6 @@ impl<T> Needle<T> {
         use InjectionMethod::*;
         match injection_method {
             x64ThreadHijacking => unsafe {
-                let base_address = get_base_address_of_process(self.0.handle);
-                if base_address == 0 {
-                    return Err(InjectionErrors::FailedToFindBaseAddress.into());
-                }
                 let cpath = cpath.unwrap();
                 let thread_id = get_thread_id_off_process_id(self.0.pid);
                 if thread_id == 0 {
