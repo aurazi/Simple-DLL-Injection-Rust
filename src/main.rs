@@ -16,14 +16,14 @@ use process::{Process, __GetFullPathNameW};
 
 #[cfg(target_arch = "x86_64")]
 const INJECTION_METHODS_CFG: [InjectionMethod; 3] = [
-    InjectionMethod::LoadLibrary,
+    InjectionMethod::CreateRemoteThreadInject,
     InjectionMethod::x64ThreadHijacking,
     InjectionMethod::NtCreateThreadEx,
 ];
 
 #[cfg(not(target_arch = "x86_64"))]
 const INJECTION_METHODS_CFG: [InjectionMethod; 2] = [
-    InjectionMethod::LoadLibrary,
+    InjectionMethod::CreateRemoteThreadInject,
     InjectionMethod::x86ThreadHijacking,
 ];
 
@@ -42,10 +42,10 @@ fn main() -> Result<()> {
 
     if cfg!(target_arch = "x86_64") {
         println!(
-            "Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking\n[c] NtCreateThreadEx"
+            "Choose injection method:\n[a] CreateRemoteThread\n[b] ThreadHijacking\n[c] NtCreateThreadEx"
         );
     } else {
-        println!("Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking");
+        println!("Choose injection method:\n[a] CreateRemoteThread\n[b] ThreadHijacking");
     }
     let injection_method;
     loop {
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         process_target = process_target.trim().to_lowercase();
         match &process_target[..] {
             "a" => {
-                println!("[LoadLibrary] injection method selected\n");
+                println!("[CreateRemoteThread] injection method selected\n");
                 injection_method = INJECTION_METHODS_CFG[0];
                 break;
             }

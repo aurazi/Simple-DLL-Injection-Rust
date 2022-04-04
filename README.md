@@ -4,7 +4,7 @@ Down to its core they all just call LoadLibraryW,
 but there are different methods of calling it:
 
 ```
-- LoadLibrary
+- CreateRemoteThread
 - ThreadHijacking
 - NtCreateThreadEx [x86_64 ONLY]; because I keep getting status violation HAHAA *help*
 ```

@@ -98,7 +98,7 @@ pub struct Needle<T>(pub Process<T>);
 
 #[derive(Copy, Clone)]
 pub enum InjectionMethod<'a> {
-    LoadLibrary,
+    CreateRemoteThreadInject,
     NtCreateThreadEx,
     x64ShellCode(&'a [u8]),
     x64ThreadHijacking,
@@ -161,7 +161,7 @@ where
             x64ShellCode(payload) => unsafe {
                 return x64_shellcode(&self.0, payload);
             },
-            LoadLibrary => unsafe {
+            CreateRemoteThreadInject => unsafe {
                 return load_library(&self.0, cpath);
             },
         }
