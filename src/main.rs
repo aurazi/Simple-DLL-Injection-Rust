@@ -15,9 +15,10 @@ use path::CPath;
 use process::{Process, __GetFullPathNameW};
 
 #[cfg(target_arch = "x86_64")]
-const INJECTION_METHODS_CFG: [InjectionMethod; 2] = [
+const INJECTION_METHODS_CFG: [InjectionMethod; 3] = [
     InjectionMethod::LoadLibrary,
     InjectionMethod::x64ThreadHijacking,
+    InjectionMethod::NtCreateThreadEx,
 ];
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -39,7 +40,13 @@ fn main() -> Result<()> {
         process.pid
     );
 
-    println!("Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking");
+    if cfg!(target_arch = "x86_64") {
+        println!(
+            "Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking\n[c] NtCreateThreadEx"
+        );
+    } else {
+        println!("Choose injection method:\n[a] LoadLibrary\n[b] ThreadHijacking");
+    }
     let injection_method;
     loop {
         process_target.clear();
@@ -54,6 +61,12 @@ fn main() -> Result<()> {
             "b" => {
                 println!("[ThreadHijacking] injection method selected\n");
                 injection_method = INJECTION_METHODS_CFG[1];
+                break;
+            }
+            #[cfg(target_arch = "x86_64")]
+            "c" => {
+                println!("[NtCreateThreadEx] injection method selected\n");
+                injection_method = INJECTION_METHODS_CFG[2];
                 break;
             }
             _ => {

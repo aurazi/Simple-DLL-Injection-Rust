@@ -1,8 +1,27 @@
 # Simple-DLL-Injection-Rust
 
-Basic implementation of DLL injection using LoadLibrary through kernel32.dll, using the knowledge I've gained from my previous repository and a couple sources credited in the main.rs file.
-There is also Thread Hijacking which just has a shellcode that calls LoadLibrary, its basically an overengineered version
-of the default injection method.
+Down to its core they all just call LoadLibraryW,
+but there are different methods of calling it:
+
+```
+- LoadLibrary
+- ThreadHijacking
+- NtCreateThreadEx [x86_64 ONLY]; because I keep getting status violation HAHAA *help*
+```
+
+To use this, build to correct architecture (and ofc use the correct DLLs),
+e.g.
+for 32 bit:
+
+```
+cargo build --target=i686-pc-windows-msvc --release
+```
+
+for 64 bit:
+
+```
+cargo build --target=x86_64-pc-windows-msvc --release
+```
 
 Created for educational purposes.
 Sources Used:

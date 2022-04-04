@@ -1,6 +1,7 @@
 #![allow(non_camel_case_types)]
 
 use anyhow::Result;
+use std::ffi::c_void;
 use std::fmt::{Debug, Display};
 use std::hint::black_box;
 use std::mem;
@@ -8,14 +9,36 @@ use std::ptr::copy_nonoverlapping;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use widestring::U16CString;
 use windows::core::PCSTR;
+
+#[cfg(not(target_arch = "x86_64"))]
 use windows::Win32::{
-    Foundation::{CloseHandle, GetLastError, LPARAM, WPARAM},
+    Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, LPARAM, WPARAM},
     System::{
         Diagnostics::Debug::{
-            GetThreadContext, ReadProcessMemory, SetThreadContext, Wow64GetThreadContext,
-            Wow64SetThreadContext, WriteProcessMemory, CONTEXT, WOW64_CONTEXT,
+            ReadProcessMemory, Wow64GetThreadContext, Wow64SetThreadContext, WriteProcessMemory,
+            WOW64_CONTEXT,
+        },
+        LibraryLoader::{GetModuleHandleA, GetProcAddress},
+        Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+        },
+        Threading::{
+            CreateRemoteThread, OpenThread, ResumeThread, SuspendThread, WaitForSingleObject,
+            THREAD_ALL_ACCESS,
+        },
+        WindowsProgramming::INFINITE,
+    },
+    UI::WindowsAndMessaging::PostThreadMessageA,
+};
+
+#[cfg(target_arch = "x86_64")]
+use windows::Win32::{
+    Foundation::{CloseHandle, GetLastError, BOOL, HANDLE, LPARAM, WPARAM},
+    System::{
+        Diagnostics::Debug::{
+            GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT,
         },
         LibraryLoader::{GetModuleHandleA, GetProcAddress},
         Memory::{
@@ -37,6 +60,7 @@ use crate::process::{get_thread_id_off_process_id, Process};
 const CONTEXT_FULL: u32 = 1_048_587;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum InjectionErrors {
     #[error("Failed to virtual allocate, Last OS Error: {0}")]
     VirtualAllocExError(u32),
@@ -66,16 +90,18 @@ pub enum InjectionErrors {
     TimeOutError,
     #[error("InvalidPlatform - You may have built this on the wrong architecture or suppported architecture")]
     InvalidPlatform,
+    #[error("Undocumented error for NtCreateThreadEx, Last OS Error: {0}")]
+    NtCreateThreadExError(u32),
 }
 
 pub struct Needle<T>(pub Process<T>);
-#[allow(dead_code)]
+
 #[derive(Copy, Clone)]
 pub enum InjectionMethod<'a> {
     LoadLibrary,
+    NtCreateThreadEx,
     x64ShellCode(&'a [u8]),
     x64ThreadHijacking,
-
     x86ShellCode(&'a [u8]),
     x86ThreadHijacking,
 }
@@ -120,6 +146,9 @@ where
         }
 
         match injection_method {
+            NtCreateThreadEx => unsafe {
+                return ntcreatethreadex(&self.0, cpath);
+            },
             x86ThreadHijacking => unsafe {
                 return x86_threadhijack(&self.0, cpath);
             },
@@ -133,54 +162,9 @@ where
                 return x64_shellcode(&self.0, payload);
             },
             LoadLibrary => unsafe {
-                let cpath = cpath.unwrap();
-                let dllpath_addr = VirtualAllocEx(
-                    self.0.handle,
-                    core::ptr::null_mut(),
-                    cpath.len(),
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                );
-                if dllpath_addr.is_null() {
-                    return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
-                }
-                if WriteProcessMemory(
-                    self.0.handle,
-                    dllpath_addr,
-                    cpath.as_ptr(),
-                    cpath.len(),
-                    core::ptr::null_mut(),
-                )
-                .0 == 0
-                {
-                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
-                    return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
-                }
-                let kernel_module = GetModuleHandleA(PCSTR("kernel32.dll\0".as_ptr()));
-                if kernel_module.is_invalid() {
-                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
-                    return Err(InjectionErrors::GetModuleHandleAError(GetLastError().0).into());
-                }
-                let loadlib_addr = GetProcAddress(kernel_module, PCSTR("LoadLibraryW\0".as_ptr()));
-                let remote_thread_handle = CreateRemoteThread(
-                    self.0.handle,
-                    core::ptr::null(),
-                    0,
-                    mem::transmute(loadlib_addr),
-                    dllpath_addr,
-                    0,
-                    core::ptr::null_mut(),
-                );
-                if remote_thread_handle.is_invalid() {
-                    VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
-                    return Err(InjectionErrors::RemoteThreadCreationError(GetLastError().0).into());
-                }
-                WaitForSingleObject(remote_thread_handle, INFINITE);
-                CloseHandle(remote_thread_handle);
-                VirtualFreeEx(self.0.handle, dllpath_addr, 0, MEM_RELEASE);
+                return load_library(&self.0, cpath);
             },
         }
-        Ok(())
     }
 }
 
@@ -194,6 +178,14 @@ where
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn x86_shellcode<T>(_: &Process<T>, _: &[u8]) -> Result<()>
+where
+    T: AsRef<str> + ToString + Send + Sync + Debug + Display + 'static,
+{
+    return Err(InjectionErrors::InvalidPlatform.into());
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn ntcreatethreadex<T>(_: &Process<T>, _: Option<CPath>) -> Result<()>
 where
     T: AsRef<str> + ToString + Send + Sync + Debug + Display + 'static,
 {
@@ -716,5 +708,145 @@ where
     }
     VirtualFreeEx(process.handle, code_cave, 0, MEM_RELEASE);
     VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+    Ok(())
+}
+
+unsafe fn load_library<T>(process: &Process<T>, cpath: Option<CPath>) -> Result<()> {
+    let cpath = cpath.unwrap();
+    let dllpath_addr = VirtualAllocEx(
+        process.handle,
+        core::ptr::null_mut(),
+        cpath.len(),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    if dllpath_addr.is_null() {
+        return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
+    }
+    if WriteProcessMemory(
+        process.handle,
+        dllpath_addr,
+        cpath.as_ptr(),
+        cpath.len(),
+        core::ptr::null_mut(),
+    )
+    .0 == 0
+    {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
+    }
+    let kernel_module = GetModuleHandleA(PCSTR("kernel32.dll\0".as_ptr()));
+    if kernel_module.is_invalid() {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::GetModuleHandleAError(GetLastError().0).into());
+    }
+    let loadlib_addr = GetProcAddress(kernel_module, PCSTR("LoadLibraryW\0".as_ptr()));
+    let remote_thread_handle = CreateRemoteThread(
+        process.handle,
+        core::ptr::null(),
+        0,
+        mem::transmute(loadlib_addr),
+        dllpath_addr,
+        0,
+        core::ptr::null_mut(),
+    );
+    if remote_thread_handle.is_invalid() {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::RemoteThreadCreationError(GetLastError().0).into());
+    }
+    WaitForSingleObject(remote_thread_handle, INFINITE);
+    CloseHandle(remote_thread_handle);
+    VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn ntcreatethreadex<T>(process: &Process<T>, cpath: Option<CPath>) -> Result<()>
+where
+    T: AsRef<str> + ToString + Send + Sync + Debug + Display + 'static,
+{
+    let cpath = cpath.unwrap();
+    let dllpath_addr = VirtualAllocEx(
+        process.handle,
+        core::ptr::null_mut(),
+        cpath.len(),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    if dllpath_addr.is_null() {
+        return Err(InjectionErrors::VirtualAllocExError(GetLastError().0).into());
+    }
+    if WriteProcessMemory(
+        process.handle,
+        dllpath_addr,
+        cpath.as_ptr(),
+        cpath.len(),
+        core::ptr::null_mut(),
+    )
+    .0 == 0
+    {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::WriteProcessMemoryError(GetLastError().0).into());
+    }
+    let ntdll_module = GetModuleHandleA(PCSTR("ntdll.dll\0".as_ptr()));
+    if ntdll_module.is_invalid() {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::GetModuleHandleAError(GetLastError().0).into());
+    }
+    let kernel_module = GetModuleHandleA(PCSTR("kernel32.dll\0".as_ptr()));
+    if kernel_module.is_invalid() {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::GetModuleHandleAError(GetLastError().0).into());
+    }
+    let loadlib_addr = GetProcAddress(kernel_module, PCSTR("LoadLibraryW\0".as_ptr()));
+    let ncreate_addr = GetProcAddress(ntdll_module, PCSTR("NtCreateThreadEx\0".as_ptr()));
+    type PHANDLE = *mut HANDLE;
+    type ACCESS_MASK = u32;
+    type NTSTATUS = i32;
+    type LPVOID = *mut c_void;
+    type DWORD = u32;
+    type LPTHREAD_START_ROUTINE = Option<unsafe extern "system" fn(LPVOID) -> DWORD>;
+    // because silly windows-rs dont got them
+
+    type nt_thread_signature = unsafe extern "C" fn(
+        PHANDLE,
+        ACCESS_MASK,
+        LPVOID,
+        HANDLE,
+        LPTHREAD_START_ROUTINE,
+        LPVOID,
+        BOOL,
+        DWORD, // stack size is dependant on architecture
+        DWORD,
+        DWORD,
+        LPVOID,
+    ) -> NTSTATUS;
+    let ncreate_addr = mem::transmute::<_, nt_thread_signature>(ncreate_addr);
+    let mut r_thread: HANDLE = mem::zeroed();
+
+    ncreate_addr(
+        &mut r_thread,
+        THREAD_ALL_ACCESS.0,
+        core::ptr::null_mut(),
+        process.handle,
+        mem::transmute(loadlib_addr),
+        dllpath_addr,
+        BOOL(0),
+        0,
+        0,
+        0,
+        core::ptr::null_mut(),
+    );
+    if r_thread.is_invalid() {
+        VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+        return Err(InjectionErrors::NtCreateThreadExError(GetLastError().0).into());
+    }
+    // idk why WaitForSingleObject doesn't work here... its just NtCreateThreadEx is undocumented...
+    // works for 64 bit tho so idk!!
+
+    WaitForSingleObject(r_thread, INFINITE);
+    CloseHandle(r_thread);
+    VirtualFreeEx(process.handle, dllpath_addr, 0, MEM_RELEASE);
+
     Ok(())
 }
